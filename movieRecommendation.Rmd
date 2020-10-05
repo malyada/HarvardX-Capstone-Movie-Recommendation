@@ -1,0 +1,487 @@
+---
+title: "Movie Recommendation"
+output:
+  pdf_document: 
+    latex_engine: xelatex
+  html_document:
+    fig_height: 4
+    highlight: pygments
+    theme: spacelab
+---
+
+
+## Overview
+
+Movie recommendation system uses movie ratings data of different movies given by different users to make movie recommendations for the each user.
+
+In this project, the goal is: Given a dataset of movies and ratings (not all movies are rated by all users and not all users rate all movies), we need to predict the rating that a user would give to a movie he hasn't yet rated.
+
+We will be using the standard movielens 10M dataset for this project.
+
+For each observation, we will be given userId, movieId, rating, timestamp, title and genres.
+
+As an optimization metric, we will be using RMSE (root mean squared error) metric.
+We will report the best model (model with lower rmse) at the end.
+
+We will start with analyzing the data, making a base model and improving its performance towards the end. We will be noting down the test rmse at every point of progress.
+
+Loading libraries and downloading the data:
+```{r}
+#load the needed libraries
+library(tidyverse)
+library(caret)
+library(data.table)
+library(Metrics)
+library(rafalib)
+library(recosystem)
+library(parallel)
+library(furrr)
+
+#getting datasets
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+# if using R 3.6 or earlier:
+#movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(levels(movieId))[movieId],
+#                                           title = as.character(title),
+#                                           genres = as.character(genres))
+# if using R 4.0 or later:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+```
+
+The data set has a total 10 million data points.  
+Divide the data into train(edx) and test(validation) sets with test set as 10% of the total data:
+```{r}
+# Create edx set, validation set (final hold-out test set)
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- as.tibble(temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId"))
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- as.tibble(rbind(edx, removed))
+```
+
+```{r, include=FALSE}
+#remove unnecessary objects to save memory
+rm(movielens)
+rm(movies)
+rm(removed)
+rm(temp)
+rm(ratings)
+rm(test_index)
+```
+
+## Analyzing data (EDA)
+
+
+```{r}
+print(head(edx))
+ 
+
+edx %>% summarise(
+  n_users=n_distinct(userId),# unique users from train
+  n_movies=n_distinct(movieId),# unique movies from train
+  min_rating=min(rating),  # the lowest rating 
+  max_rating=max(rating) # the highest rating
+)
+```
+
+We have 69878	unique users and 10677 unique movies in the edx (train) set.
+If we multiply n_users x n_movies, we get a number of almost 750 million. To visualize this is not possible because of the size constraints and it might crash r. Lets visualize some movies users.
+Matrix for a random sample of 100 movies and 100 users with yellow indicating a user/movie combination for which we have a rating.
+```{r}
+users <- as.vector(sample(unique(edx$userId), 100))
+rafalib::mypar()
+edx %>% filter(userId %in% users) %>% 
+  select(userId, movieId, rating) %>%
+  mutate(rating = 1) %>%
+  spread(movieId, rating) %>% select(sample(ncol(.), 100)) %>% 
+  as.matrix() %>% t(.) %>%
+  image(1:100, 1:100,. , xlab="Movies", ylab="Users") + 
+abline(h=0:100+0.5, v=0:100+0.5, col = "grey")
+```
+
+```{r, include = FALSE}
+#remove objects no longer needed
+rm(keep)
+rm(users)
+```
+
+we see that the matrix is too sparse. There are too few filled ratings among the entire grid
+
+Distribution of the avg rating of the movies
+```{r img1}
+edx %>%
+  group_by(movieId) %>%
+  summarise(movierating = mean(rating)) %>%
+  ggplot(aes(movierating)) +
+  geom_histogram()
+```
+
+We see that all movies do not have a uniform average rating. Some movies have less than the total average rating, and some have more.
+We can say there is a bias for each movie which makes it's rating go away from the total average rating. Lets say it is movie bias(bm)
+
+Distribution of the avg rating given by the users
+```{r img2}
+edx %>%
+  group_by(userId) %>%
+  summarise(userrating = mean(rating)) %>%
+  ggplot(aes(userrating)) +
+  geom_histogram()
+```
+
+We also notice that the users do not have a uniform average rating. Some users have less avg rating and some have more. User will be biased towards some particular movie and also in general each user may have the tendency to give more or less ratings. We therefore try to derive the user bias (bu) as well.
+
+## Methods and Analysis
+
+Let's first try the simplest of all models, giving the average of all ratings as any prediction
+
+```{r}
+mu <- mean(edx$rating)
+cat('trainig rmse :', rmse(edx$rating, mu))
+base_rmse <- rmse(validation$rating, mu)
+rmse_results <- tibble(Model = "Average of ratings", RMSE = base_rmse)
+cat('test rmse :', base_rmse)
+```
+
+We know from the data exploration that there exists a movie bias.
+Since there are so many rows.. fitting a linear model takes a lot of time
+We know that the least square estimate bi is just the average of yi - mu  for each movie i. So we can compute them.
+y is the rating
+mu is the mean of all ratings
+```{r}
+mbias <- edx %>%
+  group_by(movieId) %>%
+  summarise(bm = mean(rating - mu)) %>%
+  ungroup()
+```
+
+Distribution of (movie bias) bm
+```{r img3}
+mbias %>%
+  ggplot(aes(bm)) + geom_histogram()
+```
+
+```{r}
+#train rmse
+pred <- mu + edx %>%
+  left_join(mbias, by = 'movieId') %>%
+  .$bm
+pred = ifelse(pred >= 0, pred, 0)
+cat('train rmse :', rmse(edx$rating, pred))
+#test rmse
+pred <- mu + validation %>%
+  left_join(mbias, by = 'movieId') %>%
+  .$bm
+pred = ifelse(pred >= 0, pred, 0)
+bm_rmse = rmse(validation$rating, pred)
+rmse_results <- bind_rows(rmse_results,
+                          tibble(Model="movie_bias_effect",  
+                                     RMSE = bm_rmse))
+cat('test rmse :', bm_rmse)
+```
+
+We see that the rmse has reduced a little.. but is not up to the mark.
+We also know from the eda that there is a user bias.
+It is not practical to do a linear regression for userbias(bu) and movie bias(bm).
+We know that bu is the average of yiu - mu − bi (i is any movie i, u is any user u)
+y is the rating
+mu is the mean of all ratings
+b is the moviebias
+```{r}
+ubias <- edx %>%
+  left_join(mbias, by = 'movieId') %>%
+  group_by(userId) %>%
+  summarise(bu = mean(rating - mu - bm)) %>%
+  ungroup()
+```
+Distribution of (user bias) bu
+```{r img4}
+ubias %>%
+  ggplot(aes(bu)) + geom_histogram()
+```
+
+```{r}
+#train rmse
+pred <- mu + edx %>%
+  left_join(mbias, by = 'movieId') %>%
+  left_join(ubias, by = 'userId') %>%
+  mutate(req = bm + bu) %>%
+  .$req
+pred = ifelse(pred >= 0, pred, 0)
+cat('train rmse:', rmse(edx$rating, pred))
+#test rmse
+pred <- mu + validation %>%
+  left_join(mbias, by = 'movieId') %>%
+  left_join(ubias, by = 'userId') %>%
+  mutate(req = bm + bu) %>%
+  .$req
+pred = ifelse(pred >= 0, pred, 0)
+bmu_rmse <- rmse(validation$rating, pred)
+rmse_results <- bind_rows(rmse_results,
+                          tibble(Model="movie_user_bias_effect",  
+                                     RMSE = bmu_rmse))
+cat('test rmse:', bmu_rmse)
+```
+
+The rmse has further reduced, though not so significantly. Let us first look at the samples where the model made huge error.
+```{r}
+analysis <- edx %>%
+  left_join(mbias, by = 'movieId') %>%
+  left_join(ubias, by = 'userId') %>%
+  mutate(predr = (bm + bu + mu), diff = (predr - rating))  %>%
+  group_by(title) %>%
+  summarise(n = n(), rating =  mean(rating), predr = mean(predr), diff = mean(diff), diffsq = diff^2) %>%
+  arrange(-diffsq) 
+print(head(analysis, 20))
+cat('avg number of ratings per movie', mean(analysis$n))
+
+```
+
+We have an avg of 843 ratings per movie, lets see how many odd ones are present. say the odd ones are the ones having less than 50 ratings
+
+```{r}
+analysis %>%
+  filter(n < 50)
+```
+
+There are roughly 3500 odd movies with less than 50 ratings.. this will drastically effect our analysis
+
+Cases where we underestimated
+```{r}
+analysis %>%
+  filter(diff < 0, n < 50) %>%
+  arrange(-diffsq)
+```
+
+Cases where we overestimated 
+```{r}
+analysis %>%
+  filter(diff > 0, n < 50) %>%
+  arrange(-diffsq)
+```
+
+since we have extremes in the movies which are rated less.. in most cases by one or 2 users its is good to regularize the moviebias (bm) and user bias (bu) in order to penalize the estimates that come from small sample sizes.
+
+lambda be the regularization parameter for the movies with less data.
+We will follow the same procedure as used so far.. but with regularization parameter.
+
+To choose the appropriate regularization parameter lambda using 4 fold cross validation. lets divide the edx set to 4 sets.
+
+```{r}
+set.seed(1, sample.kind="Rounding")
+tmp <- createDataPartition(y = edx$rating, times = 1, p = 0.5, list = F)
+t <- edx[tmp, ]
+p <- createDataPartition(y = t$rating, times = 1, p = 0.5, list = F)
+p1 <- t[p, ]
+p2 <- t[-p, ]
+t <- edx[-tmp, ]
+p <- createDataPartition(y = t$rating, times = 1, p = 0.5, list = F)
+p3 <- t[p, ]
+p4 <- t[-p, ]
+
+v <- list(p1, p2, p3, p4)
+```
+We will try running the steps parallely to optimize time
+```{r}
+#lambda is the regularization parameter which we will optimize over the regltn set
+possible_lambdas <- seq(4, 5.5, by = 0.25)
+
+plan(multicore) #we will be using multiprocessing to run in parallel
+
+options(future.globals.maxSize= 891289600)
+
+getrmses <- function(l) {
+  r <- future_map_dbl(v, getmeancvrmse, l = l) 
+  mean(r)
+}
+
+getmeancvrmse <- function(temp, l = 0) {
+  #we make train and regltn sets appropriately for all the 4 cross validation folds
+  train <- anti_join(edx, temp)
+  # Make sure userId and movieId in regltn set are also in train set
+  regltn <- temp %>% 
+    semi_join(train, by = "movieId") %>%
+    semi_join(train, by = "userId")
+  
+  # Add rows removed from regltn set back into train set
+  removed <- anti_join(temp, regltn)
+  train <- rbind(train, removed)
+  
+  mbias <- train %>%
+    group_by(movieId) %>%
+    summarise(bm = sum(rating - mu)/(n() + l)) %>%
+    ungroup()
+  ubias <- train %>%
+    left_join(mbias, by = 'movieId') %>%
+    group_by(userId) %>%
+    summarise(bu = sum(rating - mu - bm)/(n() + l)) %>%
+    ungroup()
+  pred <- mu + regltn %>%
+    left_join(mbias, by = 'movieId') %>%
+    left_join(ubias, by = 'userId') %>%
+    mutate(req = bm + bu) %>%
+    .$req
+  pred = ifelse(pred >= 0, pred, 0)
+  rmse(regltn$rating, pred)
+}
+rmses <- future_map_dbl(possible_lambdas, getrmses)
+```
+Plotting rmses vs lambdas
+```{r img5}
+plot(possible_lambdas, rmses)
+rmses
+```
+Best lambda
+```{r}
+l <- possible_lambdas[min(rmses) == rmses]
+print(l)
+```
+
+We got the optimal value of lambda(l). We can now train the whole edx set upon the validation parameter.
+Working : If n() for a movie/user is large, it doesn't make much difference in moviebias(bm) / userbias(bu). But if n() for a movie/user is very small, then the moviebias(bm) / userbias(bu) will be less than what they otherwise would be.. helping in getting a less inaccurate estimate for smaller samples.
+
+Training the whole set on l.
+```{r}
+mbias <- edx %>%
+  group_by(movieId) %>%
+  summarise(bm = sum(rating - mu)/(n() + l)) %>%
+  ungroup()
+
+ubias <- edx %>%
+  left_join(mbias, by = 'movieId') %>%
+  group_by(userId) %>%
+  summarise(bu = sum(rating - mu - bm)/(n() + l)) %>%
+  ungroup()
+```
+Predictions and results
+```{r}
+#predictions for train and test sets
+predtrain <- mu + edx %>%
+  left_join(mbias, by = 'movieId') %>%
+  left_join(ubias, by = 'userId') %>%
+  mutate(req = bm + bu) %>%
+  .$req
+predtrain = ifelse(predtrain >= 0, predtrain, 0)
+
+predtest <- mu + validation %>%
+  left_join(mbias, by = 'movieId') %>%
+  left_join(ubias, by = 'userId') %>%
+  mutate(req = bm + bu) %>%
+  .$req
+predtest = ifelse(predtest >= 0, predtest, 0)
+#rmse computations
+cat('train rmse :', rmse(edx$rating, predtrain))
+mbreg_bias <- rmse(validation$rating, predtest)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Model="regularised_movie_user_bias_effect",  
+                                     RMSE = mbreg_bias))
+cat('test rmse :', mbreg_bias)
+```
+
+Let us get the residuals of the predictions and then perform matrix factorization on the residuals.
+```{r}
+edx_res <- edx %>% 
+  left_join(mbias, by = "movieId") %>%
+  left_join(ubias, by = "userId") %>%
+  mutate(res = rating - mu - bm - bu) %>%
+  select(userId, movieId, res)
+head(edx_res)
+```
+
+We will be using recosystem library to perform matrix factorization on the residuals. For this both training and test set needs to be arranged in 3 columns userId, movieId, rating which will be transformed to a matrix format.
+
+Note: We will be predicting residuals using this model, and the residuals will be added to output of the best model obtained so far. Then rmse is computed and compared with other models.
+
+```{r}
+# as matrix 
+train_fact <- as.matrix(edx_res)
+test_fact <- validation %>% 
+  select(userId, movieId, rating)
+test_fact <- as.matrix(test_fact)
+
+# build a recommender object
+r <-Reco()
+
+# write train_fact and test_fact tables on disk
+write.table(train_fact , file = "trainset.txt" , sep = " " , row.names = FALSE, col.names = FALSE)
+write.table(test_fact, file = "validset.txt" , sep = " " , row.names = FALSE, col.names = FALSE)
+
+# use data_file() to specify a data set from a file in the hard disk.
+# r$tune needs training data to be of type DataSource.
+set.seed(2000) 
+train_fact <- data_file("trainset.txt")
+test_fact <- data_file("validset.txt")
+```
+We will tune the training data with r$tune to get the best optimal parameters for training.
+```{r}
+# tuning training set using the default 5 fold cross validation
+cores <- detectCores()
+opts <- r$tune(train_fact, opts = list(dim = c(40, 45), lrate = c(0.05, 0.1, 0.2),
+                                      costp_l1 = 0, costq_l1 = 0,
+                                      nthread = (cores - 1), niter = 10))
+opts
+```
+Training the model and making predictions
+```{r}
+# training the recommender model
+r$train(train_fact, opts = c(opts$min, nthread = 1, niter = 20))
+
+# Making prediction on validation set and calculating RMSE:
+pred_file <- tempfile()
+r$predict(test_fact, out_file(pred_file))  
+y_pred_resid <- scan(pred_file)
+```
+Adding the predictions to our previous model test output predtest.
+```{r}
+y_pred <- predtest + y_pred_resid
+rmse_mf <- RMSE(y_pred,validation$rating) 
+cat('final Rmse:', rmse_mf)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Model="factorization + regularised_movie_user_bias",  
+                                     RMSE = rmse_mf))
+```
+
+## Results and Conclusions / Future Work
+
+We see how rmse reduced over the models and we get a final rmse of < 0.79 on the test(validation) set. 
+```{r}
+print(rmse_results)
+```
+
+We still have some issues in the model to be addressed:
+
+1) Sometimes the model predicts a rating of less than 5 or greater than 5. Though this doesn't effect the recommendation system as the above 5 rating are surely recommended and lower ones are not recommended provided the system is equipped with getting < 0 or > 5 ratings.. else the system would not function as expected. 
+Reason: According to our model, some users can have more(+/-) user bias and some movies can have more(+/-) movie bias. We finally output y = mu + moviebias + userbias + residualpredictions.
+So overall the y can be cross the limits of 0 and 5.
+
+2) If a user is absolutely new, we cannot know any of his preferences to recommend which is called coldstart problem. 
+
+Future work:
+ 1) As a solution for coldstart problem the in normal scenario is to recommend user higher rated movies. But the problem of user may not like some depending on their gender/age/employment_status.
+To resolve that we should be provided with user profile details. Using the details of the profile, to know which category they belong to, recommend them the best recommendations given for a person of their category on average. That might enhance the user experience more than just giving mean of all ratings.
+
+3) Use timestamp and genres info to extract further useful information to reduce the rmse.
+
+4) Use title for finding movies like starwars - part 1, 2, 3, 4. If the user likes starwars, they are likely to like the other movie series too.
+
+
+
